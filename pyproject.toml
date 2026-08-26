@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nequip-extension-template"
+dynamic = ["version"]
+description = "TODO"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+authors = [
+    {name = "your name here"},
+]
+
+dependencies = [
+    "nequip>=0.13.0"
+]
+
+[tool.setuptools.packages.find]
+include = ["nequip-extension-template", "nequip_extension_template", "nequip_extension_template.*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "nequip_extension_template._version.__version__"}
+
+[tool.ruff]
+line-length = 88
+exclude = [
+    ".eggs",
+    "*.egg",
+    "build",
+    "dist",
+    "docs",
+    ".git",
+    "__pycache__",
+    "examples",
+    "tmp"
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "C90"]
+ignore = ["E226", "E501", "E741", "E743", "C901", "E203"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[project.entry-points."nequip.extension"]
+init_always = "nequip_extension_template"
