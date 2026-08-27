@@ -1,0 +1,12 @@
+
+
+#base water dataset to start from, when generating frames
+data:
+  _target_: nequip.data.datamodule.WaterDataModule
+  data_source_dir: /n/holylabs/kozinsky_lab/Users/gharari/00-NequDev/Muon/OPT_sweeps_H2Oab/water_data
+  transforms:
+    - _target_: nequip.data.transforms.NeighborListTransform
+      r_max: ${cutoff_radius}
+    - _target_: nequip.data.transforms.ChemicalSpeciesToAtomTypeMapper
+      model_type_names: ${chemical_symbols}
+  train_val_test_split: [0.8, 0.1, 0.1]
