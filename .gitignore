@@ -161,3 +161,7 @@ cython_debug/
 
 # agent resume pointer (session-local)
 HANDOFF.md
+
+# sandbox binaries and generated frames
+testartifacts/inputs/
+testartifacts/out/

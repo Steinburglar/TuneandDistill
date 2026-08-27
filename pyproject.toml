@@ -45,5 +45,8 @@ ignore = ["E226", "E501", "E741", "E743", "C901", "E203"]
 quote-style = "double"
 indent-style = "space"
 
+[project.scripts]
+nequip-distill = "nequip_extension_template.scripts.distill:main"
+
 [project.entry-points."nequip.extension"]
 init_always = "nequip_extension_template"
