@@ -19,30 +19,53 @@ Design source: `planning.md` (this repo). Broader framework vision: `../Zero2Tun
 `../distillation/` is **NOT precedent/source of truth** here (different repo, Snakemake-based).
 Cite it ONLY for the rattle algorithm + ASE artifact gotchas below.
 
-## State — 2026-08-27
+## State — 2026-08-28
 
-**Sampling half DONE + verified on GPU (commit `d61ee43`).** Student side (train handoff) NOT
-started. Sampler resume NOT implemented — that's the next task, see Next steps.
+**Sampling half DONE + verified on GPU (`d61ee43`, RNG fix `96d54c8`). Sampler resume: HALF DONE
+(`f9689f3`) — record written + read back, rattle resumes, MD does NOT, every config change
+refused.** Student side (train handoff) NOT started.
 
 `nequip_extension_template/sample/`
 - `sampler.py` — base `Sampler`. Holds calculator, `base_frames`, `sample_path`, `n_written`,
-  `split_counts`. Abstract surface = `finished` (property) + `step()`. Concrete:
-  `split_file(s)` / `train_file` / `val_file` / `test_file`, `append(atoms, split)`, `generate()`.
-  `generate()` currently HARD-REFUSES (`FileExistsError`) if any split file already exists —
-  placeholder until resume (Next steps #1) lands.
+  `n_resumed`, `split_counts`, `state_interval`, `sampler_config`. Abstract surface = `finished`
+  (property) + `step()`. Overridable: `procedure_state()` (default `{}`),
+  `restore_progress(blob)` (default RAISES `NotImplementedError` → a sampler not taught to
+  resume refuses instead of duplicating everything). Concrete: `split_file(s)` /
+  `train_file` / `val_file` / `test_file`, `append(atoms, split)`, `state_file`, `write_state()`,
+  `read_state()`, `check_goal(stored)`, `truncate_to(offsets)`, `generate()`.
+  Module fns: `frames_digest(frames)`, `flatten(dict)`.
+- **resume, as implemented (`f9689f3`)** — `sampler_state.pt` beside the dataset holds
+  `{version, sampler_class, goal: {config, base_frames}, progress: {n_written, split_counts,
+  offsets, procedure}}`. `offsets` = byte length of each split file. Written every
+  `state_interval` structures (default 1) + at end, atomically (`.pt.tmp` + `os.replace`).
+  `generate()` order on resume: read → restore counters → `check_goal` → `truncate_to` →
+  `restore_progress`. Refuses: unknown `version`, different `sampler_class`, split files with NO
+  record, file shorter than recorded offset, `sampler_config is None`, ANY config difference.
+  File LONGER than offset → truncated + warned (this fires even at `state_interval=1`, measured).
 - `rattle.py` — `RattleSampler`. Owns `label()` (teacher call + `SinglePointCalculator`).
+  Resumes: `procedure_state()` = `{"n_steps": ...}`, nothing else. Order is fixed (variant-major)
+  and the goal must be unchanged, so the count IS the position.
 - `md.py` — `MDSampler`. Langevin NVT, ONE trajectory from `base_frames[0]`, rest ignored (warns).
+  CANNOT resume — inherits the base `restore_progress` refusal, no md.py code needed. Needs
+  positions + velocities + `rng.bit_generator.state` (Next steps #2).
 - `split.py` — free fns, NOT a base-class method. `assign_splits(n, split, seed, policy)`,
   `policy` = `"scattered"` (torch shuffle) or `"blocked"` (contiguous train→val→test ranges).
 - `__init__.py` — exports `Sampler`, `RattleSampler`, `MDSampler`.
 
 `nequip_extension_template/scripts/distill.py` — hydra entry, `@hydra.main(version_base=None,
 config_path=os.getcwd(), config_name="config")`, same shape as `nequip.scripts.train.main`. Only
-`run: [sample]` implemented; anything else raises `NotImplementedError`.
+`run: [sample]` implemented; anything else raises `NotImplementedError`. Sets
+`sampler.sampler_config = OmegaConf.to_container(config.sampler, resolve=True)` AFTER
+`instantiate` — NOT as a ctor arg, `instantiate` recurses into args hunting `_target_` and would
+build the teacher twice. Logs new-vs-already-present via `sampler.n_resumed`.
 `nequip_extension_template/scripts/__init__.py` — added (was missing, needed for import).
 
-`pyproject.toml` — `[project.scripts] nequip-distill = "nequip_extension_template.scripts.distill:main"`
-added. Still template-shaped otherwise: `nequip>=0.13.0` too loose (want `>=0.17,<0.18`, not yet
+`tests/test_resume.py` — 16 tests, ~26 s, CPU only, NO teacher and NO GPU. `pytest` from repo
+root (config in `pyproject.toml`). See "Test suite" below.
+
+`pyproject.toml` — `[project.scripts] nequip-distill = "nequip_extension_template.scripts.distill:main"`,
+`[project.optional-dependencies] test = ["pytest"]`, `[tool.pytest.ini_options] testpaths`.
+Still template-shaped otherwise: `nequip>=0.13.0` too loose (want `>=0.17,<0.18`, not yet
 done), `name="TODO"`-style placeholders in `description`/`authors`, `license={file=LICENSE}` but
 no LICENSE file. Package name stays `nequip_extension_template` — DELIBERATE, no final name
 chosen; rename later touches `pyproject.toml` (`name`, `packages.find.include`, entry-points,
@@ -63,9 +86,10 @@ free from the dynamics step (Langevin already evaluates energy/forces every step
 
 **D2. `step()` does everything for one step**: produce + label + append + advance own state, in
 one call. `generate()` just loops `while not self.finished: self.step()`. No separate
-produce/label seam (D1), no base-class `checkpoint_every` (checkpointing not yet implemented,
-see Next steps #1). **No guard against a subclass whose `step()` doesn't advance `finished`** —
-would loop forever.
+produce/label seam (D1). **No guard against a subclass whose `step()` doesn't advance
+`finished`** — would loop forever. D2's original "no base-class `checkpoint_every`" is SUPERSEDED
+(`f9689f3`): the base class owns the state file, so it owns the cadence — `state_interval`, default
+1 (a teacher call costs far more than one `torch.save`).
 
 **D3. Base class owns ONLY three empty boxes**: the three split file paths + `append(atoms,
 split)`. It does NOT decide sample count, procedure params, or what goes in them — those are
@@ -92,23 +116,57 @@ wired to the trainer (Next steps #2), point `train_file_path`/`val_file_path`/`t
 at these three files directly; `data.split_dataset` fractions become irrelevant to sampled data.
 
 **D6. Restart precedence for sampling: REVERSED from the original plan.** Live config wins;
-sampler diffs stored goal vs. live goal and warns loudly on any change, does not silently ignore
-the live config. Three-way distinction: progress state (n_written, offsets) / stored goal
-(procedure params as of last write) / live goal (current config) — stored goal is a diff
-baseline + legality guard, not behavior-driving. NOT YET IMPLEMENTED (no state file exists yet;
-this is the design for Next steps #1).
+sampler diffs stored goal vs. live goal, does not silently ignore the live config. Three-way
+distinction: progress state (n_written, offsets, procedure blob) / stored goal / live goal —
+stored goal is a diff baseline + legality guard, not behavior-driving.
 
-**D7. Never pickle sampler/calculator.** Compiled/CUDA-bound torch models non-portable across
-nodes/GPU archs. Planned `sampler_state.pt` (per split file, so THREE byte offsets, not one) via
-`torch.save`, `weights_only=False` on load, contents = plain numpy/dicts only. Truncate rule
-(append-then-save-state isn't atomic → on resume truncate each split file to its recorded byte
-offset) still the plan.
-- **RNG-per-item derivation — UNCOMMITTED WIP, `rattle.py` only.** Working tree has an unstaged
-  diff (not in commit `d61ee43`, not in session notes): `frame_key(atoms)` (sha256 of species/
-  positions/cell/pbc, stable under base-frame reordering) + `derive_seed(seed, key, variant)`
-  give each structure its own `np.random.default_rng`, replacing the one streaming generator.
-  `md.py` NOT touched — still one streaming `np.random.default_rng(seed)`, still order-dependent.
-  Finish (port to `md.py`) or commit/stash before other rattle.py edits land.
+**PARTLY IMPLEMENTED (`f9689f3`)**: the diff exists (`Sampler.check_goal`) but ANY difference is
+FATAL, nothing is a warning yet and nothing is legal yet. Classification (which changes are legal,
+which fatal) = Next steps #1.
+
+**D6a. Stored goal = a COPY OF THE `sampler` CONFIG, not a hand-picked list of params (user,
+settled).** A hand-written `goal()` per sampler duplicates every ctor kwarg and silently omits any
+new one — the exact shape of the `anisotropic_strain_magnitude` bug. `distill.py` hands over
+`OmegaConf.to_container(config.sampler, resolve=True)`; the sampler stores it verbatim.
+Two things the config alone CANNOT express, so they are stored beside it:
+- `base_frames` is a PATH. Edit the file, keep the path, and a config-vs-config diff sees nothing.
+  Fixed by `frames_digest(self.base_frames)` (hashes the LOADED structures, not file bytes, so
+  re-exporting the same frames in a different text layout is not a false alarm).
+- MD uses only `base_frames[0]`, so its digest over all frames is over-strict. Not yet addressed.
+NO exclusion list yet (user explicit): `state_interval` and `calculator.device` are compared too,
+so a resume on a different device currently REFUSES. Deliberate — exempting keys one at a time is
+how a real difference gets waved through. Exclusions land with the classification step.
+**Consequence to know:** `state_interval` isn't in the yaml, so it needs `+sampler.state_interval=N`
+(hydra ADD not override), and a run started that way must be resumed with the same flag or the
+live config is missing the key → `state_interval: 5 -> <not set>`.
+
+**D7. Never pickle sampler/calculator. IMPLEMENTED (`f9689f3`).** Three reasons, in order:
+(a) a pickled sampler carries its OLD config, and D6 says the live config wins — so the pickle
+buys nothing and makes it easy to miss an attribute; (b) compiled/CUDA-bound torch models are
+non-portable across nodes/GPU archs; (c) a pickle is coupled to class layout, so renaming an
+attribute silently breaks every existing `sample_path` — a plain dict breaks loudly via the
+`version` check. `sampler_state.pt` via `torch.save`, `weights_only=False` on load, contents =
+plain numpy/dicts only, THREE byte offsets (one per split file). Truncate-to-offset implemented in
+`Sampler.truncate_to`: longer than recorded → truncate + warn; SHORTER, or missing with a nonzero
+offset → hard error (record and dataset are not from the same run, nothing to recover).
+
+**D7a. RNG derivation is ASYMMETRIC between samplers (settled, `96d54c8`) — load-bearing for
+resume.**
+- `RattleSampler`: no streaming RNG. Each structure seeded by `derive_seed(seed,
+  frame_key(base_frame), variant_label)`, both module-level fns in `rattle.py`. `frame_key` =
+  sha256 of numbers + positions (rounded 8) + cell (rounded 8) + pbc, truncated 16 hex chars.
+  Structure depends ONLY on its own identity, never generation order — **nothing to checkpoint
+  for rattle's RNG.** Variant identity is a LABEL not a position (`"iso:-0.05"`, `"aniso:0"`) so
+  adding a strain magnitude doesn't renumber existing variants. `atoms.info` now carries
+  `base_frame`, `base_frame_key`, `variant` (MD still carries `md_step`).
+- `MDSampler`: KEEPS one streaming `np.random.default_rng(seed)` — must, trajectory is
+  sequential, snapshot n only exists via integrating 1..n-1. **Resuming MD requires
+  checkpointing `self.rng.bit_generator.state` alongside positions/velocities** (documented in
+  `md.py` docstring, not implemented — see Next steps #2).
+- **Open trap: CLOSED (`f9689f3`).** Changing `anisotropic_strain_magnitude` on purpose had the
+  same silent effect as the bug the decoupling fixed. Now caught, because D6a stores the whole
+  config — as are `seed`, `strain_magnitudes`, `max_displacement_ang`, and base-frame content.
+  Tested (`tests/test_resume.py`).
 
 ## Design decisions — student side (SETTLED, NOT yet implemented)
 
@@ -278,6 +336,16 @@ base frame, one structure per entry in `strain_magnitudes` (isotropic volume sca
 per-atom rattle bounded by `max_displacement_ang`. Variant-major ordering (confirmed): every base
 frame gets variant 0 before any gets variant 1.
 
+**Anisotropic strain bound decoupled from `strain_magnitudes` (`96d54c8`).** `RattleSampler` kwarg
+`anisotropic_strain_magnitude: float = 0.05` replaces the derived
+`max_strain_magnitude = max(abs(strain_magnitudes))` inherited from `gen_synthetic_geoms.py`. The
+derived form coupled two knobs: adding one isotropic scan point silently widened the anisotropic
+distribution with no change to any structure's name, so nothing could detect it (measured before
+fix: adding a strain magnitude left 20/20 `iso` structures bit-identical but changed 10/10
+`aniso`; after fix, all 30 bit-identical). Default 0.05 matches old expression's value for the
+default `strain_magnitudes`, so default behaviour unchanged. `testartifacts/rattle_only.yaml`
+sets it explicitly.
+
 **Hard-won magnitude lesson**: ±10%/5% strain + 0.5 Å displacement pushed frames OOD for the
 teacher, students WORSE than no synthetic data. Halved defaults (±5%/2.5% strain, 0.25 Å
 displacement, matching `rattle.py`'s `strain_magnitudes`/`max_displacement_ang` defaults) fixed
@@ -296,6 +364,10 @@ it. Rattle displacement must be measured against the STRAINED parent, not the un
   alone because MD is scaffolding; becomes a real correctness issue if MD output is trusted.
 - numpy 2: `ndarray.ptp()` is gone, use `np.ptp(arr)`.
 - Don't name a scratch script `inspect.py` — shadows stdlib, breaks numpy/ase import.
+- **Determinism-test trap:** `frames[0].copy()` has the SAME content hash as `frames[0]` by
+  construction (D7a's `frame_key`) — testing "adding a base frame leaves existing structures
+  identical" with a copied frame passes trivially, proves nothing. Use a genuinely unused frame
+  (source has 200, `base_frames.xyz` uses first 10 — frames 10+ are free for this).
 
 ## Artifact gotchas inherited from `../distillation/`
 
@@ -335,10 +407,40 @@ All runs go through Slurm (user explicit, never login node).
 
 **Last known-good smoke test** (both configs, pre-commit `d61ee43`): `rattle_only` → 50 labeled
 structures (train=40, val=5, test=5) into `testartifacts/out/rattle_smoke`. `md_only` → 30
-(train=24, val=3, test=3) into `testartifacts/out/md_smoke`.
+(train=24, val=3, test=3) into `testartifacts/out/md_smoke`. NOTE both predate `f9689f3`, so they
+have NO `sampler_state.pt` — pointing a run at them now hard-errors (split files, no record). Same
+for any `testartifacts/out/s2_*` left lying around.
+
+**Resume verified on GPU** (A100-SXM4-40GB, `f9689f3`): runs killed at 51/200 and at 80/200 (the
+latter at `state_interval=5`, so truncation actually ran) resumed to datasets holding the same 200
+structures, no duplicates, each in the same split and the same in-file order as an uninterrupted
+run, positions and cells BIT-IDENTICAL.
 
 No pre-commit git hook installed in `.git/hooks/` (config present, hook never run); ruff not in
 the nequip311 env (`No module named ruff`) — lint by hand before committing.
+
+## Test suite
+
+`tests/test_resume.py`, 16 tests, ~26 s, run with plain `pytest` from the repo root.
+
+**CPU only, NO teacher, NO GPU — and that is a correctness decision, not just speed (user
+explicit: no GPU test).** Calculator = `ase.calculators.lj.LennardJones`, base frames = 12
+synthetic 8-atom Ar cells built in a module fixture at three file lengths (10/11/12). Reason: the
+real teacher is a compiled model on GPU and two runs over BIT-IDENTICAL geometry disagree by
+~3e-6 eV / ~4e-6 eV/Ang (float reductions not associative, order not fixed — MEASURED between two
+uninterrupted runs). So with the real teacher, "resumed == uninterrupted" is only checkable to a
+tolerance; with LJ it is a comparison of file hashes, which also catches a dropped, duplicated or
+mis-filed structure. **So: byte-identity of extxyz is NOT a valid criterion whenever the teacher
+runs on GPU.** For manual GPU checks use instead: same structure set, same split per structure,
+positions/cell EXACTLY equal, |dE| and |dF| < 1e-5.
+
+Test helpers: `build(...)` mirrors what `distill.py` does — same settings both construct the
+sampler AND become `sampler_config`. `kill_after(sampler, n)` wraps `step` to raise after exactly
+n appends (a structure count, not a wall-clock timeout, so the kill lands at a known point).
+
+**Suite was mutation-checked**, each mutation caught only by the right tests:
+`truncate_to` → no-op ⇒ 2 failures; rattle `restore_progress` forgets `n_steps` ⇒ 3;
+`check_goal` early-return ⇒ 3.
 
 ## Conventions
 
@@ -361,11 +463,27 @@ the nequip311 env (`No module named ruff`) — lint by hand before committing.
 
 ## Next steps (ordered)
 
-1. **Sampler resume state** (D6/D7). Decide on the uncommitted `rattle.py` RNG-per-item WIP
-   (commit it, finish porting to `md.py`, or revert) before building on top of it. Then: write
-   per-split-file `sampler_state.pt` (or similar), atomic write, truncate-to-byte-offset on
-   resume (3 offsets now). Three-way goal handling: identical → silent restart; differs → loud
-   warn w/ key-by-key diff. Replace `generate()`'s current hard-refuse placeholder.
-2. Hand dataset to `nequip.scripts.train.main(config)` per D9 — three `*_file_path` lists, strip
+**Work in SMALL steps, plan first, no code until the plan is agreed (user explicit, learned the
+hard way this session).** Present a short plain-language plan naming exactly what the step adds
+and what it deliberately leaves out; do NOT bundle steps; do NOT write smoke tests or extra
+verification that wasn't asked for.
+
+1. **Classify goal changes** (finishes D6). Today ANY config difference is fatal. Split into:
+   fatal (`seed`, `max_displacement_ang`, `anisotropic_strain_magnitude`, split params — change
+   these and structures on disk were drawn under settings the config no longer describes);
+   legal-and-extending (more `strain_magnitudes`, higher `n_random_strain_samples`, more base
+   frames, higher `n_samples`); irrelevant (`state_interval`, `calculator.device`). Prefer
+   declaring the SMALL legal/irrelevant sets and defaulting everything else to fatal, so a knob
+   added later is safe until someone thinks about it. Removing anything already on disk stays
+   fatal — a written structure cannot be un-written.
+2. **MD trajectory state** — positions + velocities + `rng.bit_generator.state` (D7a), replacing
+   the inherited `restore_progress` refusal.
+3. **Growing a dataset changes SPLIT ASSIGNMENT, and that is its own problem.** Re-running
+   `assign_splits` at a larger total MOVES already-written items between files. Items on disk must
+   keep their split; new items must be apportioned to close the gap to the target sizes at the new
+   total. Rattle splits per base frame (so the map must be keyed by frame hash, not list index);
+   MD splits per snapshot, and with `blocked` each extension gets its OWN contiguous val/test tail
+   rather than one tail for the whole trajectory — a real cost, flag it before building.
+4. Hand dataset to `nequip.scripts.train.main(config)` per D9 — three `*_file_path` lists, strip
    `sample` from `run`, drop `sampler`/`sample_path`.
-3. `student_path` (D15, now settled) + `student_state.json` + D14 archive hook.
+5. `student_path` (D15, now settled) + `student_state.json` + D14 archive hook.
