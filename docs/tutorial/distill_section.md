@@ -13,13 +13,13 @@ separate so the vendored notebook stays byte-identical to upstream.
 
 # Distilling into a fast, specialized model
 
-Our fine-tuned model is accurate on silicon, but it is still a foundation model: many
-layers, and every chemical species it was pre-trained on. If we only want long MD on
-silicon, we are paying for a lot we will never use.
+While fine-tuning a foundation model can increase your domain accuracy, the resulting model is still very large,
+and thus slow to evaluate, which can make long production MD simulations difficult.
 
-We can instead use it as a *teacher*. The teacher labels structures for free, so we
-can generate far more data than we have DFT for — by rattling and straining the frames
-we already have — and train a small silicon-only *student* on those labels.
+
+
+To solve this issue, we can instead use it as a *teacher*. The teacher labels structures relatively cheaply, so we
+can generate far more data than we have DFT for and train a small silicon-only *student* on those labels.
 
 This is `nequip-distill`, a NequIP extension. Sampling, labeling and training happen
 in one command.
@@ -51,11 +51,11 @@ run: [sample, train, val, test]
 sample_path: ./distill_dataset
 ```
 
-`sample_path` is where the generated structures go, as three files — `train.extxyz`,
-`val.extxyz`, `test.extxyz` — plus a record of how far sampling got. The split is
+`sample_path` is where the generated structures go, as `train.extxyz`,
+`val.extxyz`, and `test.extxyz`, plus a record of what has been sampled so far. The split is
 fixed as structures are written, not re-derived from fractions at training time, so
-growing the dataset later cannot move a test structure into training. Re-running the
-same command resumes rather than starting over. `data` therefore has no
+that growing the dataset later cannot move a test structure into training or vice versa. Re-running the
+same command resumes sampling rather than starting over. Importantly, in contrast to a normal config,yaml, `data` has no
 `split_dataset` and no `*_file_path`; `nequip-distill` fills those in.
 
 Second, a `sampler` block says how to generate structures and which teacher labels
@@ -75,11 +75,11 @@ sampler:
   max_displacement_ang: 0.25
 ```
 
-with this particular sampler, each base frame is strained — an isotropic volume scan plus a few random anisotropic
+With this particular sampler, each base frame is strained — an isotropic volume scan plus a few random anisotropic
 strains — and then rattled. That is 5 variants of each of our 110 frames, so 550
 structures from 110. The DFT labels in `sitraj.xyz` are discarded; the teacher labels
 everything. See the comments in `distill.yaml` for the rest of the options.
-Different ways of sampling synthetically labelled frames is an active area of research, and the Nequip team plans to add more samplers in the future. For now, we provide a simple rattle sampler as a starting point.
+Different ways of sampling synthetically labelled frames is an active area of research, and the Nequip team plans to add more samplers in the future, such as using MD to sample new structures. For now, we provide a simple rattle sampler as a starting point.
 
 ## [code]
 
@@ -93,6 +93,8 @@ Different ways of sampling synthetically labelled frames is an active area of re
 The command samples and labels the 550 structures, releases the teacher from the GPU,
 and then hands the config to NequIP's own trainer — everything from `data` down is
 stock NequIP, and checkpoints land in `./results_distill` as usual.
+
+Note that the training, validation, and test metrics are all relative to the teacher's labels, and not DFT. To properly evaluate the student, one should run a separate evaluation on a held-out DFT dataset, which is not yet included in this tutorial.
 
 
 

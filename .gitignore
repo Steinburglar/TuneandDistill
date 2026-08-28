@@ -165,3 +165,6 @@ HANDOFF.md
 # sandbox binaries and generated frames
 testartifacts/inputs/
 testartifacts/out/
+
+# scratch script for the curiosity cluster, not part of the repo
+curiosity_distill.sbatch
