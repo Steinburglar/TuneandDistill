@@ -51,6 +51,19 @@ STATE_FILE = "sampler_state.pt"
 STATE_VERSION = 1
 
 
+def split_file(sample_path: Union[str, Path], split: str) -> Path:
+    """Where the structures of one split live inside a ``sample_path``.
+
+    A free function as well as a :class:`Sampler` method, because the
+    ``nequip-distill`` script needs these paths in runs that do no sampling at all
+    -- there is no sampler to ask, and building one would load the teacher onto a
+    GPU for nothing.
+    """
+    if split not in SPLITS:
+        raise ValueError(f"unknown split {split!r}, expected one of {list(SPLITS)}")
+    return Path(sample_path) / f"{split}.extxyz"
+
+
 def frames_digest(frames: Sequence[Atoms]) -> str:
     """One hash over the structures a sampler actually loaded.
 
@@ -183,9 +196,7 @@ class Sampler:
     # ----------------------------------------------------------------- dataset files
 
     def split_file(self, split: str) -> Path:
-        if split not in SPLITS:
-            raise ValueError(f"unknown split {split!r}, expected one of {list(SPLITS)}")
-        return self.sample_path / f"{split}.extxyz"
+        return split_file(self.sample_path, split)
 
     @property
     def train_file(self) -> Path:
