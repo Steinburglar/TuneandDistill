@@ -65,8 +65,8 @@ root (config in `pyproject.toml`). See "Test suite" below.
 
 `pyproject.toml` — `[project.scripts] nequip-distill = "nequip_extension_template.scripts.distill:main"`,
 `[project.optional-dependencies] test = ["pytest"]`, `[tool.pytest.ini_options] testpaths`.
-Still template-shaped otherwise: `nequip>=0.13.0` too loose (want `>=0.17,<0.18`, not yet
-done), `name="TODO"`-style placeholders in `description`/`authors`, `license={file=LICENSE}` but
+`nequip>=0.17.1,<0.18` (`01e07a8`+, was the template's `>=0.13.0`; 0.17.1 is what everything was
+validated against). Still template-shaped otherwise: `name="TODO"`-style placeholders in `description`/`authors`, `license={file=LICENSE}` but
 no LICENSE file. Package name stays `nequip_extension_template` — DELIBERATE, no final name
 chosen; rename later touches `pyproject.toml` (`name`, `packages.find.include`, entry-points,
 `version.attr`) + every intra-pkg import.
