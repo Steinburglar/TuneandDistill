@@ -49,7 +49,9 @@ installed editable into nequip311.**
   resume refuses instead of duplicating everything). Concrete: `split_file(s)` /
   `train_file` / `val_file` / `test_file`, `append(atoms, split)`, `state_file`, `write_state()`,
   `read_state()`, `check_goal(stored)`, `truncate_to(offsets)`, `generate()`.
-  Module fns: `frames_digest(frames)`, `flatten(dict)`.
+  Module fns: `frames_digest(frames)`, `flatten(dict)`, `split_file(sample_path, split)` (also
+  exported from `sample/__init__` w/ `SPLITS` — `distill.py` needs the 3 paths in runs that build
+  no sampler).
 - **resume, as implemented (`f9689f3`)** — `sampler_state.pt` beside the dataset holds
   `{version, sampler_class, goal: {config, base_frames}, progress: {n_written, split_counts,
   offsets, procedure}}`. `offsets` = byte length of each split file. Written every
@@ -86,13 +88,8 @@ build the teacher twice. Logs new-vs-already-present via `sampler.n_resumed`.
 - nequip does `if "ckpt_path" in config:` — PRESENCE, not value. A config spelling out
   `ckpt_path: null` would enter the restart branch and `torch.load(None)`. So the key is POPPED
   when it is None.
-- D11 trap: new structures + a `ckpt_path` from a completed run → nequip loads `run_stage ==
-  len(run)`, executes zero stages, exits 0 having trained on nothing new. `main` counts new
-  structures and RAISES. Warm start (Path B) is the real fix and is not built.
-
-`Sampler.split_file` is now a thin wrapper over module fn `sampler.split_file(sample_path,
-split)`, exported from `sample/__init__` along with `SPLITS` — `distill.py` needs the 3 paths in
-runs that build no sampler.
+- D11 guard: `main` counts `n_written` before/after sampling, RAISES if it grew AND `ckpt_path`
+  is given. Mechanism/trap detail: D11.
 
 **`exclude_keys` is a NON-ISSUE for our provenance keys** (checked, do not "fix" it):
 `nequip/data/ase.py:55` builds `include_keys` from `ase_all_properties` + the user's
@@ -110,10 +107,12 @@ root (config in `pyproject.toml`). `tests/smoke_tests.py` — 15 `nequip-distill
 `nequip>=0.17.1`, NO upper bound (user, 2026-08-28 — wants it usable with nequip 0.19; env still
 has 0.17.1, which is what every integration fact here was validated against, so 0.19 is UNTESTED.
 If it misbehaves, re-check the two things the student side leans on: `nequip.scripts.train.main`
-taking a config as its first positional arg, and `run_stage` restart semantics). Still template-shaped otherwise: `name="TODO"`-style placeholders in `description`/`authors`, `license={file=LICENSE}` but
-no LICENSE file. Package name stays `nequip_extension_template` — DELIBERATE, no final name
-chosen; rename later touches `pyproject.toml` (`name`, `packages.find.include`, entry-points,
-`version.attr`) + every intra-pkg import.
+taking a config as its first positional arg, and `run_stage` restart semantics). Still
+template-shaped otherwise: `description = "TODO"`, `authors = [{name = "your name here"}]`
+placeholders (no `license` key — removed this session, build refused without a LICENSE file).
+Package name stays `nequip_extension_template` — DELIBERATE, no final name chosen; rename later
+touches `pyproject.toml` (`name`, `packages.find.include`, entry-points, `version.attr`) + every
+intra-pkg import.
 
 `_keys.py` still registers upstream template placeholder fields (`user_facing_graph_field_name`,
 `user_facing_node_field_name`) — unused, delete or replace whenever touched.
@@ -285,18 +284,11 @@ Not a short-run artifact (checked at 5 and 6 epochs and against a 20-epoch GPU r
 happened to BE the last epoch so it hid the effect).
 
 **Consequence: `ckpt_path=.../last.ckpt` resumes from the last IMPROVING epoch and silently drops
-everything after it.** Harmless on a still-improving run, expensive on a plateau. Fix = a second,
-purely temporal callback next to the monitored one:
-```yaml
-- _target_: lightning.pytorch.callbacks.ModelCheckpoint
-  monitor: null           # saves every epoch, unconditionally
-  dirpath: ${hydra:runtime.output_dir}
-  filename: latest
-  save_top_k: 1           # one file, overwritten each epoch
-  enable_version_counter: false
-```
-NOT added yet — belongs with D15 (`student_path`), and `testartifacts/rattle_train.yaml` still
-has the single monitored callback.
+everything after it.** Harmless on a still-improving run, expensive on a plateau. A second,
+unconditional `ModelCheckpoint(monitor: null, filename: latest)` callback PROPOSED then REJECTED
+by user (2026-08-28): "this is nequip behavior, which we dont want to change. lets not worry
+about it." **Do not re-propose** — left alone on purpose as nequip/lightning's own checkpoint
+semantics. `testartifacts/rattle_train.yaml` keeps the single monitored callback.
 
 **D13. Lightning checkpoint versioning must be OFF for a shared student dir.** Confirmed in
 installed lightning `model_checkpoint.py`: version counter (`enable_version_counter=True`
