@@ -144,6 +144,18 @@ class RattleSampler(Sampler):
             len(self.base_frames), split, split_seed, split_policy
         )
 
+    def procedure_state(self) -> dict:
+        """How many structures have been produced. That is the whole of it.
+
+        The order is fixed -- variant-major over the base frames -- and a resume is
+        only allowed when the settings and the base frames are unchanged, so the count
+        is also the position: structure ``n_steps`` is the next one either way.
+        """
+        return {"n_steps": self.n_steps}
+
+    def restore_progress(self, procedure_state: dict) -> None:
+        self.n_steps = int(procedure_state["n_steps"])
+
     @property
     def n_total(self) -> int:
         """One structure per (base frame, variant) pair. This is the whole procedure."""

@@ -14,7 +14,7 @@ import os
 
 import hydra
 from hydra.utils import instantiate
-from omegaconf import DictConfig, ListConfig
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 # match nequip: full stack traces rather than hydra's truncated ones
 os.environ["HYDRA_FULL_ERROR"] = "1"
@@ -38,11 +38,19 @@ def main(config: DictConfig) -> None:
     # `sample_path` is a top-level key rather than a sampler argument, because it is
     # also where the trainer will later be pointed to read the dataset back.
     sampler = instantiate(config.sampler, sample_path=config.sample_path)
+    # The sampler stores this in its state file and, on a later run, compares it
+    # against the live config to decide whether the dataset on disk is one it would
+    # have produced itself. Handed over after instantiation rather than as an
+    # argument, because `instantiate` recurses into the arguments it is given looking
+    # for things to build, and this dict holds the calculator's own config.
+    sampler.sampler_config = OmegaConf.to_container(config.sampler, resolve=True)
     logger.info(f"sampling -> {config.sample_path}")
-    n_written = sampler.generate()
+    n_total = sampler.generate()
     counts = ", ".join(f"{s}={n}" for s, n in sampler.split_counts.items())
+    n_new = n_total - sampler.n_resumed
     logger.info(
-        f"wrote {n_written} labeled structures to {config.sample_path} ({counts})"
+        f"{config.sample_path} holds {n_total} labeled structures ({counts}); "
+        f"{n_new} from this run, {sampler.n_resumed} already present"
     )
 
 

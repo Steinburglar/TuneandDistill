@@ -14,15 +14,73 @@ state. Producing and labeling are not separated, because for MD-type procedures 
 are not separate events -- the dynamics needs the energy and forces to take the step,
 so the label is already in hand. Splitting them would either pay the teacher twice or
 require a cache across the seam.
+
+A run writes down what it has done, to ``sampler_state.pt`` beside the dataset, and
+reads it back if it finds one: pointing ``nequip-distill`` at a ``sample_path`` that
+already holds a dataset continues that dataset rather than refusing it.
+
+The record holds two separate things, and keeping them separate is the point:
+
+* **progress** -- what is on disk. The counters, the byte offset of the end of each
+  split file, and whatever the procedure needs to pick up where it stopped.
+* **the goal** -- a copy of the ``sampler`` config the dataset was built under, plus a
+  hash of the base frames that config named.
+
+A resumed run compares the goal in the record against the live config. At present any
+difference at all is refused. Deciding which differences are legal -- adding a strain
+magnitude is fine, changing the seed is not -- comes next; until then nothing can go
+quietly wrong, because nothing is allowed to change.
 """
 
+import hashlib
+import logging
+import os
 from pathlib import Path
-from typing import Union
+from typing import Optional, Sequence, Union
 
+import numpy as np
+import torch
 from ase import Atoms
 from ase.io import read, write
 
 from .split import SPLITS
+
+logger = logging.getLogger(__name__)
+
+STATE_FILE = "sampler_state.pt"
+STATE_VERSION = 1
+
+
+def frames_digest(frames: Sequence[Atoms]) -> str:
+    """One hash over the structures a sampler actually loaded.
+
+    The config names the base frames by *path*, so a config-to-config comparison sees
+    nothing when the file behind that path is edited. This is what notices. It hashes
+    the loaded structures rather than the file's bytes, so re-exporting the same
+    frames in a different text layout is not reported as a change.
+    """
+    h = hashlib.sha256()
+    for atoms in frames:
+        numbers = atoms.get_atomic_numbers()
+        h.update(np.ascontiguousarray(numbers, dtype=np.int64).tobytes())
+        h.update(np.ascontiguousarray(np.round(atoms.get_positions(), 8)).tobytes())
+        h.update(np.ascontiguousarray(np.round(np.asarray(atoms.cell), 8)).tobytes())
+        h.update(np.ascontiguousarray(atoms.get_pbc()).tobytes())
+    return h.hexdigest()[:16]
+
+
+def flatten(value, prefix: str = "") -> dict:
+    """Nested config dict -> flat ``{"calculator.device": "cuda"}`` form.
+
+    Only so that a difference can be reported as one short line per setting instead
+    of two whole config dumps to eyeball.
+    """
+    if isinstance(value, dict) and value:
+        flat = {}
+        for key, item in value.items():
+            flat.update(flatten(item, f"{prefix}{key}."))
+        return flat
+    return {prefix.rstrip("."): value}
 
 
 class Sampler:
@@ -39,6 +97,10 @@ class Sampler:
     sample_path
         Output directory. Passed in by the ``nequip-distill`` script from the
         top-level ``sample_path`` config key, not from the ``sampler`` section.
+    state_interval
+        How many structures to append between writes of the progress record. The
+        default writes after every structure: a teacher evaluation costs far more
+        than this record does, so there is little reason to risk repeating one.
     """
 
     def __init__(
@@ -46,12 +108,25 @@ class Sampler:
         calculator,
         base_frames: Union[str, Path],
         sample_path: Union[str, Path],
+        state_interval: int = 1,
     ):
         self.calculator = calculator
         self.base_frames = read(str(base_frames), index=":")
         self.sample_path = Path(sample_path)
+        self.state_interval = int(state_interval)
+        if self.state_interval < 1:
+            raise ValueError(
+                f"`state_interval` must be at least 1, got {state_interval!r}"
+            )
         self.n_written = 0
+        self.n_resumed = 0
         self.split_counts = {s: 0 for s in SPLITS}
+        # Set by the `nequip-distill` script, which is what has the config. Not a
+        # constructor argument: hydra's `instantiate` recurses into the arguments it
+        # is handed looking for things to build, and this dict contains the
+        # calculator's own config, so passing it that way would load the teacher
+        # twice.
+        self.sampler_config: Optional[dict] = None
 
     # ------------------------------------------------------------------ subclass API
 
@@ -75,6 +150,35 @@ class Sampler:
         structure belongs to. Use :meth:`append` to write to the dataset.
         """
         raise NotImplementedError
+
+    def procedure_state(self) -> dict:
+        """Whatever this procedure needs to pick up where it stopped.
+
+        Plain numbers, strings, dicts and arrays only -- never the sampler itself and
+        never the calculator. A compiled, CUDA-bound teacher does not survive being
+        moved to another node or another GPU, and a pickled sampler would carry the
+        old config with it, which is the opposite of what a resume should do.
+
+        Empty by default, for a procedure that needs nothing beyond the counters.
+        """
+        return {}
+
+    def restore_progress(self, procedure_state: dict) -> None:
+        """Pick up where the record says this procedure stopped.
+
+        Called after the base class has restored the counters and cut the split files
+        back to their recorded lengths, so the dataset is already in the state the
+        record describes by the time this runs.
+
+        Refusing by default is deliberate: a sampler that has not been taught to
+        resume must say so rather than start from the beginning and append a second
+        copy of everything.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot resume yet. {self.sample_path} already "
+            "holds a dataset from an earlier run -- point `sample_path` somewhere "
+            "else, or delete it."
+        )
 
     # ----------------------------------------------------------------- dataset files
 
@@ -103,19 +207,212 @@ class Sampler:
         self.n_written += 1
         self.split_counts[split] += 1
 
+    # ------------------------------------------------------------- progress record
+
+    @property
+    def state_file(self) -> Path:
+        return self.sample_path / STATE_FILE
+
+    def write_state(self) -> None:
+        """Record what has been written, atomically.
+
+        The record holds the counters and, per split file, the **byte offset** of its
+        end -- which is just its length in bytes at this moment. Two reasons for a
+        byte offset rather than a structure count. Appending a structure and writing
+        this record are two operations, so a run killed between them leaves a file
+        holding one more structure than the record knows about; cutting that file
+        back to a recorded length is a single ``truncate`` call, where cutting it back
+        to a recorded structure count would mean parsing the extxyz format from the
+        start to find where that structure begins. This relies on the split files
+        being append-only, which is all :meth:`append` ever does to them.
+
+        The offsets are read from the filesystem rather than tracked as the run goes.
+        ``append`` closes the file each time, so its size on disk is the truth; a
+        counter maintained here could disagree with it.
+
+        Written to a temporary file and moved into place with ``os.replace``, so a
+        kill during the write cannot leave a truncated or half-written record behind
+        -- either the old record is there or the new one is.
+
+        Alongside the progress, the record stores the goal: a copy of the ``sampler``
+        config this run was built from, and a hash of the base frames it loaded. The
+        config is stored rather than a hand-picked list of settings from it, so that a
+        setting cannot be left out of the record by mistake -- everything the user
+        wrote is in there. The hash is there because the config names the base frames
+        by path, and a path says nothing about whether the file behind it changed.
+        """
+        payload = {
+            "version": STATE_VERSION,
+            "sampler_class": f"{type(self).__module__}.{type(self).__qualname__}",
+            "goal": {
+                "config": self.sampler_config,
+                "base_frames": frames_digest(self.base_frames),
+            },
+            "progress": {
+                "n_written": self.n_written,
+                "split_counts": dict(self.split_counts),
+                "offsets": {
+                    s: (
+                        self.split_file(s).stat().st_size
+                        if self.split_file(s).exists()
+                        else 0
+                    )
+                    for s in SPLITS
+                },
+                "procedure": self.procedure_state(),
+            },
+        }
+        temporary = self.state_file.with_suffix(".pt.tmp")
+        torch.save(payload, temporary)
+        os.replace(temporary, self.state_file)
+
+    def read_state(self) -> Optional[dict]:
+        """Load the record, or ``None`` if there is none. Refuse one we cannot trust.
+
+        ``weights_only=False`` because this is a record of plain python values, not a
+        tensor checkpoint, and nothing writes it but :meth:`write_state`.
+        """
+        if not self.state_file.exists():
+            return None
+        state = torch.load(self.state_file, weights_only=False)
+
+        version = state.get("version")
+        if version != STATE_VERSION:
+            raise ValueError(
+                f"{self.state_file} is in record format {version!r}, this code writes "
+                f"format {STATE_VERSION}. Resuming across formats is not supported -- "
+                "point `sample_path` somewhere else, or delete it."
+            )
+        live = f"{type(self).__module__}.{type(self).__qualname__}"
+        if state.get("sampler_class") != live:
+            raise ValueError(
+                f"{self.sample_path} was sampled by {state.get('sampler_class')}, the "
+                f"config asks for {live}. One dataset is the output of one procedure "
+                "-- point `sample_path` somewhere else."
+            )
+        return state
+
+    def check_goal(self, stored_goal: dict) -> None:
+        """Refuse to continue a dataset whose settings have since changed.
+
+        Every difference is fatal here, including ones that plainly do not affect the
+        structures -- how often the record is written, which device the teacher runs
+        on. Sorting legal changes from illegal ones is the next piece of work; until
+        it exists, refusing everything is the only answer that cannot be wrong.
+        """
+        if self.sampler_config is None:
+            raise ValueError(
+                f"{self.sample_path} holds a dataset from an earlier run, but this "
+                "sampler was not given the config it is being asked to continue, so "
+                "there is nothing to compare against. The `nequip-distill` script "
+                "supplies it; a sampler built directly in a script must set "
+                "`sampler_config` itself."
+            )
+        live = flatten(self.sampler_config)
+        stored = flatten(stored_goal["config"])
+        differences = []
+        for key in sorted(set(stored) | set(live)):
+            before = stored.get(key, "<not set>")
+            after = live.get(key, "<not set>")
+            if before != after:
+                differences.append(f"  {key}: {before!r} -> {after!r}")
+        if stored_goal["base_frames"] != frames_digest(self.base_frames):
+            differences.append(
+                f"  base frame contents: {stored_goal['base_frames']} -> "
+                f"{frames_digest(self.base_frames)} (the file behind `base_frames` "
+                "has changed, even if its path has not)"
+            )
+        if differences:
+            joined = "\n".join(differences)
+            raise ValueError(
+                f"{self.sample_path} holds {self.n_written} structure(s) produced "
+                f"under different settings:\n{joined}\n"
+                "A resumed run can only continue a dataset it would have produced "
+                "itself. Put these back, or point `sample_path` somewhere else."
+            )
+
+    def truncate_to(self, offsets: dict) -> None:
+        """Cut each split file back to the length the record gives for it.
+
+        A file *longer* than its recorded length holds structures appended after the
+        record was last written -- the run died between the append and the next
+        record write. They are dropped and produced again.
+
+        A file *shorter* than its recorded length, or absent when the record says it
+        has content, means the record and these files are not from the same run.
+        Nothing sensible can be recovered from that, so it stops.
+        """
+        for split in SPLITS:
+            path = self.split_file(split)
+            offset = int(offsets[split])
+            if not path.exists():
+                if offset:
+                    raise FileNotFoundError(
+                        f"{self.state_file} says {split} holds {offset} bytes, but "
+                        f"{path} does not exist."
+                    )
+                continue
+            size = path.stat().st_size
+            if size < offset:
+                raise ValueError(
+                    f"{path} is {size} bytes, shorter than the {offset} bytes "
+                    f"{self.state_file} records for it. The record and the dataset in "
+                    f"{self.sample_path} are not from the same run -- point "
+                    "`sample_path` somewhere else."
+                )
+            if size > offset:
+                logger.warning(
+                    f"{path}: dropping the last {size - offset} byte(s), appended "
+                    "after the record was last written; they will be produced again."
+                )
+                with open(path, "r+b") as f:
+                    f.truncate(offset)
+
     # --------------------------------------------------------------------- main loop
 
     def generate(self) -> int:
-        """Step until finished. Returns how many structures were written."""
+        """Step until finished, continuing an existing dataset if there is one.
+
+        Returns the number of structures in the dataset, including any that were
+        already there before this call. ``n_resumed`` is how many of those predate it.
+        """
         self.sample_path.mkdir(parents=True, exist_ok=True)
-        existing = [
-            str(self.split_file(s)) for s in SPLITS if self.split_file(s).exists()
-        ]
-        if existing:
-            raise FileExistsError(
-                f"{existing} already exist. This sampler cannot resume yet -- delete "
-                "them, or point `sample_path` somewhere else."
+        state = self.read_state()
+
+        if state is None:
+            existing = [
+                str(self.split_file(s)) for s in SPLITS if self.split_file(s).exists()
+            ]
+            if existing:
+                raise FileExistsError(
+                    f"{existing} already exist, but {STATE_FILE} does not. Without it "
+                    "there is no record of what those structures are or what settings "
+                    "produced them, so they can neither be continued nor safely "
+                    "appended to -- delete them, or point `sample_path` somewhere "
+                    "else."
+                )
+        else:
+            progress = state["progress"]
+            # counters first, so the refusal below can say how much is at stake
+            self.n_written = int(progress["n_written"])
+            self.n_resumed = self.n_written
+            self.split_counts = {s: int(progress["split_counts"][s]) for s in SPLITS}
+            self.check_goal(state["goal"])
+            # before anything trusts the file lengths
+            self.truncate_to(progress["offsets"])
+            self.restore_progress(progress["procedure"])
+            counts = ", ".join(f"{s}={n}" for s, n in self.split_counts.items())
+            logger.info(
+                f"continuing {self.sample_path}: {self.n_written} structure(s) "
+                f"already written ({counts})"
             )
+
+        since_write = 0
         while not self.finished:
             self.step()
+            since_write += 1
+            if since_write >= self.state_interval:
+                self.write_state()
+                since_write = 0
+        self.write_state()
         return self.n_written

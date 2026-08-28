@@ -14,6 +14,13 @@ class is checked against a procedure that is nothing like rattling:
 * its labels come from the dynamics, which already evaluated the teacher to take the
   step, so no extra teacher call is made to label a snapshot
 
+**This sampler cannot resume yet.** A count is enough for rattling, which walks a
+fixed list, but a snapshot only exists by integrating the trajectory up to it, so
+continuing one means restoring positions, velocities and the state of the random
+number generator. Until that is built, pointing a second run at a ``sample_path``
+that already holds MD output is refused by
+:meth:`~.sampler.Sampler.restore_progress`. Fresh runs are unaffected.
+
 **Assumption.** Splitting per snapshot is only sound if ``sample_interval`` is long
 enough that consecutive snapshots are decorrelated. Nothing here checks that, and
 nothing can: if the interval is too short, neighbouring snapshots are near-duplicates
