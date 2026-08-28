@@ -8,17 +8,17 @@ dynamic = ["version"]
 description = "TODO"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {file = "LICENSE"}
 authors = [
     {name = "your name here"},
 ]
 
 dependencies = [
     # 0.17.1 is what every run and every integration fact in CLAUDE.md was checked
-    # against. The upper bound is not caution for its own sake: the student side leans
-    # on `nequip.scripts.train.main` taking a config as its first argument and on the
-    # `run_stage` restart semantics, both read out of 0.17.1's source.
-    "nequip>=0.17.1,<0.18"
+    # against. No upper bound, so newer nequip can be used -- but the student side
+    # leans on `nequip.scripts.train.main` taking a config as its first argument and
+    # on the `run_stage` restart semantics, both read out of 0.17.1's source, so
+    # re-check those two if a newer nequip misbehaves.
+    "nequip>=0.17.1"
 ]
 
 [project.optional-dependencies]
