@@ -56,6 +56,12 @@ class MDSampler(Sampler):
         How many snapshots to keep. This is the whole extent of the procedure.
     seed
         RNG seed for the initial velocities and the thermostat noise.
+
+        Unlike :class:`~.rattle.RattleSampler`, this is one *streaming* generator, and
+        it has to be. A trajectory is sequential by nature: snapshot n is reached by
+        integrating through snapshots 1..n-1, so a snapshot cannot be derived from its
+        own identity alone. Resuming therefore means checkpointing the generator state
+        (``self.rng.bit_generator.state``) along with the positions and velocities.
     split, split_seed, split_policy
         Target fractions, assigned per snapshot. Defaults to ``"blocked"``: snapshots
         are ordered in time, so a contiguous holdout at the end of the trajectory is

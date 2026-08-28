@@ -6,7 +6,7 @@ deformed and then rattled, once per *variant*:
 * one isotropic volume scan point per entry in ``strain_magnitudes`` -- the cell is
   scaled by ``(1 + strain) ** (1/3)`` with the atoms scaled along with it
 * ``n_random_strain_samples`` structures with a random symmetric anisotropic strain,
-  bounded by the largest ``strain_magnitudes`` entry
+  bounded by ``anisotropic_strain_magnitude``
 
 followed in both cases by a per-atom random displacement of up to
 ``max_displacement_ang``.
@@ -17,6 +17,7 @@ displacement pushed structures outside the teacher's domain and produced student
 fixed it.
 """
 
+import hashlib
 from typing import Sequence
 
 import numpy as np
@@ -25,6 +26,26 @@ from ase.calculators.singlepoint import SinglePointCalculator
 
 from .sampler import Sampler
 from .split import assign_splits
+
+
+def frame_key(atoms: Atoms) -> str:
+    """Content hash of a structure, used as its stable identity.
+
+    Stable under reordering the base-frame file, so adding or reordering base frames
+    never renames the existing ones.
+    """
+    h = hashlib.sha256()
+    h.update(np.ascontiguousarray(atoms.get_atomic_numbers(), dtype=np.int64).tobytes())
+    h.update(np.ascontiguousarray(np.round(atoms.get_positions(), 8)).tobytes())
+    h.update(np.ascontiguousarray(np.round(np.asarray(atoms.cell), 8)).tobytes())
+    h.update(np.ascontiguousarray(atoms.get_pbc()).tobytes())
+    return h.hexdigest()[:16]
+
+
+def derive_seed(seed: int, key: str, variant: str) -> int:
+    """Seed for one structure, derived from its identity rather than its position."""
+    digest = hashlib.sha256(f"{seed}|{key}|{variant}".encode()).digest()
+    return int.from_bytes(digest[:8], "big")
 
 
 def isotropic_strain_matrix(volumetric_strain: float) -> np.ndarray:
@@ -53,10 +74,26 @@ class RattleSampler(Sampler):
         Volumetric strains for the isotropic scan, one variant each.
     n_random_strain_samples
         Number of random anisotropic-strain variants per base frame.
+    anisotropic_strain_magnitude
+        Bound on each component of the random anisotropic strain.
+
+        Deliberately independent of ``strain_magnitudes``. The reference
+        implementation derived it as ``max(abs(strain_magnitudes))``, which couples
+        the two knobs: adding one point to the isotropic scan silently widens the
+        anisotropic distribution, so every ``aniso`` structure already on disk was
+        drawn from a different distribution than the config now describes -- with no
+        change to its name, and so nothing to detect it by. Changing this value on
+        purpose has the same effect, which is why it belongs in the goal diff that
+        resume compares against.
     max_displacement_ang
         Upper bound on the per-atom displacement, in Angstrom.
     seed
-        RNG seed for the strains and displacements.
+        Base RNG seed. Each structure gets its own stream derived from ``seed``, the
+        content hash of its base frame, and its variant label -- not from one shared
+        stream. So a structure depends only on its own identity, never on how many
+        structures were generated before it. That is what lets a resumed or extended
+        run reproduce exactly the structures a fresh run would have produced, with no
+        RNG state to checkpoint.
     split
         Target train/val/test fractions.
     split_seed
@@ -75,6 +112,7 @@ class RattleSampler(Sampler):
         self,
         strain_magnitudes: Sequence[float] = (-0.05, -0.025, 0.0, 0.025, 0.05),
         n_random_strain_samples: int = 3,
+        anisotropic_strain_magnitude: float = 0.05,
         max_displacement_ang: float = 0.25,
         seed: int = 0,
         split: dict = None,
@@ -86,16 +124,16 @@ class RattleSampler(Sampler):
         self.strain_magnitudes = [float(s) for s in strain_magnitudes]
         self.n_random_strain_samples = int(n_random_strain_samples)
         self.max_displacement_ang = float(max_displacement_ang)
-        self.max_strain_magnitude = (
-            max(abs(s) for s in self.strain_magnitudes)
-            if self.strain_magnitudes
-            else 0.0
-        )
-        self.rng = np.random.default_rng(seed)
+        self.anisotropic_strain_magnitude = float(anisotropic_strain_magnitude)
+        self.seed = int(seed)
         self.n_steps = 0
+        self.base_frame_keys = [frame_key(a) for a in self.base_frames]
 
-        self.variants = [("iso", s) for s in self.strain_magnitudes]
-        self.variants += [("aniso", i) for i in range(self.n_random_strain_samples)]
+        # A variant is identified by its label, not its position in this list, so
+        # adding a strain magnitude does not renumber the anisotropic variants and
+        # change structures that already exist.
+        self.variants = [f"iso:{s}" for s in self.strain_magnitudes]
+        self.variants += [f"aniso:{i}" for i in range(self.n_random_strain_samples)]
         if not self.variants:
             raise ValueError(
                 "this procedure has no variants -- `strain_magnitudes` is empty and "
@@ -139,18 +177,24 @@ class RattleSampler(Sampler):
         variant_index = self.n_steps // len(self.base_frames)
         self.n_steps += 1
 
-        kind, value = self.variants[variant_index]
+        variant = self.variants[variant_index]
+        key = self.base_frame_keys[base_index]
+        rng = np.random.default_rng(derive_seed(self.seed, key, variant))
+
+        kind, value = variant.split(":", 1)
         if kind == "iso":
-            strain_matrix = isotropic_strain_matrix(value)
+            strain_matrix = isotropic_strain_matrix(float(value))
         else:
             strain_matrix = random_anisotropic_strain_matrix(
-                self.rng, self.max_strain_magnitude
+                rng, self.anisotropic_strain_magnitude
             )
 
         atoms = self.base_frames[base_index].copy()
         atoms.set_cell(strain_matrix @ atoms.cell[:], scale_atoms=True)
-        rattle_positions(self.rng, atoms, self.max_displacement_ang)
+        rattle_positions(rng, atoms, self.max_displacement_ang)
 
         labeled = self.label(atoms)
         labeled.info["base_frame"] = base_index
+        labeled.info["base_frame_key"] = key
+        labeled.info["variant"] = variant
         self.append(labeled, self.base_frame_split[base_index])
