@@ -481,6 +481,38 @@ our configs), `rattle_only.yaml`, `md_only.yaml`, `rattle_train.yaml`. Gitignore
   energy/forces DISCARDED, teacher relabels. 10 chosen so 0.8/0.1/0.1 apportions to 8/1/1.
 - Named "base frames" not "seed frames" — collided with `n200_seed1` naming AND with RNG seed.
 
+## Tutorial — `docs/tutorial/`
+
+Upstream `mir-group/nequip-tutorial` VENDORED VERBATIM @ `8f90935` (2026-03-09, MIT):
+`NequIP_Tutorial.ipynb` (32 cells), `config.yaml`, `config_finetuning.yaml`,
+`sitraj.xyz` (110 frames, 64-atom Si, PBC), `README.md`, `LICENSE`. Never hand-edit —
+`SOURCE.md` holds the refresh recipe. Tutorial is NOT in the nequip repo itself.
+
+Ours:
+- `distill_section.md` — our section, one cell per `## [markdown]` / `## [code]` marker.
+  Preamble + `<!-- TODO -->` comments stripped at build. Written to match upstream's
+  terse 1–3-paragraph cells (user rejected a 3x longer first draft).
+- `distill.yaml` — Si distillation config. Teacher = fine-tuned OAM-S, packaged from
+  `results_ft/best.ckpt`. 110 base frames x 5 variants = 550 structures, 88/11/11 base
+  frames → 440/55/55. Student: 2 layers, `l_max: 1`, `num_features: 32`, `[Si]` only,
+  r_max 5.0, ZBL on. Heavily commented — detail lives HERE, not in the prose.
+- `build_notebook.py` → `NequIP_Distill_Tutorial.ipynb` (38 cells = upstream verbatim +
+  our 6). GENERATED. Edit the md/yaml and re-run; never edit the notebook.
+
+**NEVER RUN. `distill.yaml` has not been executed once**, and Colab installs current
+nequip, not the 0.17.1 everything here was validated against. User tests in Colab.
+
+Colab link needs repo PUBLIC + pushed `main`:
+`colab.research.google.com/github/Steinburglar/TuneandDistill/blob/main/docs/tutorial/NequIP_Distill_Tutorial.ipynb`.
+Two URLs hardcode `Steinburglar/TuneandDistill@main` (the `pip install git+` cell and
+the `wget` of `distill.yaml`) — both live in `distill_section.md`, change there +
+regenerate.
+
+**Upstream bug, do not inherit:** notebook cell 29 compiles `/content/results/best.ckpt`
+— the FROM-SCRATCH model — and cell 30 plots it as "Fine-tuned model". Real one is
+`/content/results_ft/best.ckpt` (`results_dir: ./results_ft`). Our section uses the
+correct path. Worth reporting upstream.
+
 ## Run commands
 
 ```bash
