@@ -19,6 +19,19 @@ Design source: `planning.md` (this repo). Broader framework vision: `../Zero2Tun
 `../distillation/` is **NOT precedent/source of truth** here (different repo, Snakemake-based).
 Cite it ONLY for the rattle algorithm + ASE artifact gotchas below.
 
+## Working paradigm (READ FIRST, every step)
+
+**SMALL STEPS, ONE AT A TIME. Plan before code, wait for approval between steps.** Before any
+code: short plain-language plan — exactly what the step adds AND what it deliberately leaves
+out. One step per plan, no bundling, no "while I'm here." No unrequested extras (no smoke
+tests, no extra verification, no GPU jobs, no refactors) unless asked. Drop caveman mode for
+plans/explanations/design talk, keep it for status. User challenges design premises hard and is
+usually right — take the challenge seriously, don't defend.
+User explicit, twice: agent once wrote the whole resume feature in one go (~800 lines: base
+class + rattle + md + split logic + 26-test suite + an unrequested GPU Slurm job). User: *"i
+feel like you wrote too much at once for me to follow it... i need to trust your code and i
+dont right now."* All reverted, GPU job cancelled, rebuilt from scratch in small approved steps.
+
 ## State — 2026-08-28
 
 **Sampling half DONE + verified on GPU (`d61ee43`, RNG fix `96d54c8`). Sampler resume: HALF DONE
@@ -140,15 +153,12 @@ how a real difference gets waved through. Exclusions land with the classificatio
 (hydra ADD not override), and a run started that way must be resumed with the same flag or the
 live config is missing the key → `state_interval: 5 -> <not set>`.
 
-**D7. Never pickle sampler/calculator. IMPLEMENTED (`f9689f3`).** Three reasons, in order:
-(a) a pickled sampler carries its OLD config, and D6 says the live config wins — so the pickle
-buys nothing and makes it easy to miss an attribute; (b) compiled/CUDA-bound torch models are
-non-portable across nodes/GPU archs; (c) a pickle is coupled to class layout, so renaming an
-attribute silently breaks every existing `sample_path` — a plain dict breaks loudly via the
-`version` check. `sampler_state.pt` via `torch.save`, `weights_only=False` on load, contents =
-plain numpy/dicts only, THREE byte offsets (one per split file). Truncate-to-offset implemented in
-`Sampler.truncate_to`: longer than recorded → truncate + warn; SHORTER, or missing with a nonzero
-offset → hard error (record and dataset are not from the same run, nothing to recover).
+**D7. Never pickle sampler/calculator. IMPLEMENTED (`f9689f3`, mechanism = the `sampler.py`
+"resume, as implemented" bullet above).** Three reasons, in order: (a) a pickled sampler carries
+its OLD config, and D6 says the live config wins — so the pickle buys nothing and makes it easy
+to miss an attribute; (b) compiled/CUDA-bound torch models are non-portable across nodes/GPU
+archs; (c) a pickle is coupled to class layout, so renaming an attribute silently breaks every
+existing `sample_path` — a plain dict breaks loudly via the `version` check instead.
 
 **D7a. RNG derivation is ASYMMETRIC between samplers (settled, `96d54c8`) — load-bearing for
 resume.**
@@ -405,16 +415,9 @@ $CONDA/bin/python -m nequip_extension_template.scripts.distill -cp $PWD/testarti
 ```
 All runs go through Slurm (user explicit, never login node).
 
-**Last known-good smoke test** (both configs, pre-commit `d61ee43`): `rattle_only` → 50 labeled
-structures (train=40, val=5, test=5) into `testartifacts/out/rattle_smoke`. `md_only` → 30
-(train=24, val=3, test=3) into `testartifacts/out/md_smoke`. NOTE both predate `f9689f3`, so they
-have NO `sampler_state.pt` — pointing a run at them now hard-errors (split files, no record). Same
-for any `testartifacts/out/s2_*` left lying around.
-
-**Resume verified on GPU** (A100-SXM4-40GB, `f9689f3`): runs killed at 51/200 and at 80/200 (the
-latter at `state_interval=5`, so truncation actually ran) resumed to datasets holding the same 200
-structures, no duplicates, each in the same split and the same in-file order as an uninterrupted
-run, positions and cells BIT-IDENTICAL.
+**`testartifacts/out/rattle_smoke` and `md_smoke` predate `f9689f3`** — no `sampler_state.pt`, so
+pointing a run at them now hard-errors (split files, no record). Same for any leftover
+`testartifacts/out/s2_*`; safe to delete, all gitignored scratch.
 
 No pre-commit git hook installed in `.git/hooks/` (config present, hook never run); ruff not in
 the nequip311 env (`No module named ruff`) — lint by hand before committing.
@@ -463,10 +466,7 @@ n appends (a structure count, not a wall-clock timeout, so the kill lands at a k
 
 ## Next steps (ordered)
 
-**Work in SMALL steps, plan first, no code until the plan is agreed (user explicit, learned the
-hard way this session).** Present a short plain-language plan naming exactly what the step adds
-and what it deliberately leaves out; do NOT bundle steps; do NOT write smoke tests or extra
-verification that wasn't asked for.
+**Follow "Working paradigm" at top of file for every step below — one at a time, plan first.**
 
 1. **Classify goal changes** (finishes D6). Today ANY config difference is fatal. Split into:
    fatal (`seed`, `max_displacement_ang`, `anisotropic_strain_magnitude`, split params — change
