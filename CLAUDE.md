@@ -36,7 +36,10 @@ dont right now."* All reverted, GPU job cancelled, rebuilt from scratch in small
 
 **Sampling half DONE + verified on GPU (`d61ee43`, RNG fix `96d54c8`). Sampler resume: HALF DONE
 (`f9689f3`) — record written + read back, rattle resumes, MD does NOT, every config change
-refused.** Student side (train handoff) NOT started.
+refused. Student side WIRED (D8/D9/D11 minus warm start): `run: [sample, train, val, test]`
+RAN END TO END ON GPU (2026-08-28, user): `nequip-distill -cp <abs>/testartifacts -cn
+rattle_train` sampled 50 structures then trained + val + test a student. `nequip-distill` CLI
+installed editable into nequip311.**
 
 `nequip_extension_template/sample/`
 - `sampler.py` — base `Sampler`. Holds calculator, `base_frames`, `sample_path`, `n_written`,
@@ -66,20 +69,48 @@ refused.** Student side (train handoff) NOT started.
 - `__init__.py` — exports `Sampler`, `RattleSampler`, `MDSampler`.
 
 `nequip_extension_template/scripts/distill.py` — hydra entry, `@hydra.main(version_base=None,
-config_path=os.getcwd(), config_name="config")`, same shape as `nequip.scripts.train.main`. Only
-`run: [sample]` implemented; anything else raises `NotImplementedError`. Sets
+config_path=os.getcwd(), config_name="config")`, same shape as `nequip.scripts.train.main`.
+`run` = optional `sample` (first, at most once) + any of `train`/`val`/`test`; the tail goes to
+`nequip.scripts.train.main(train_config)` in-process. Helpers: `_split_run_list`,
+`_check_train_config` (runs BEFORE sampling — `data`/`trainer`/`training_module` present,
+`data._target_` is an `ASEDataModule` subclass, `data.split_dataset` empty), `_dataset_files`,
+`_require_dataset` (no-`sample` runs need 3 non-empty files, sampler NOT built — would load the
+teacher onto a GPU for nothing), `_train_config`, `_release_teacher` (drops `sampler.calculator`
++ `torch.cuda.empty_cache()` before the student starts). Sets
 `sampler.sampler_config = OmegaConf.to_container(config.sampler, resolve=True)` AFTER
 `instantiate` — NOT as a ctor arg, `instantiate` recurses into args hunting `_target_` and would
 build the teacher twice. Logs new-vs-already-present via `sampler.n_resumed`.
 `nequip_extension_template/scripts/__init__.py` — added (was missing, needed for import).
 
+**Two live traps handled in `_train_config`/`main`, both from reading nequip 0.17.1's source:**
+- nequip does `if "ckpt_path" in config:` — PRESENCE, not value. A config spelling out
+  `ckpt_path: null` would enter the restart branch and `torch.load(None)`. So the key is POPPED
+  when it is None.
+- D11 trap: new structures + a `ckpt_path` from a completed run → nequip loads `run_stage ==
+  len(run)`, executes zero stages, exits 0 having trained on nothing new. `main` counts new
+  structures and RAISES. Warm start (Path B) is the real fix and is not built.
+
+`Sampler.split_file` is now a thin wrapper over module fn `sampler.split_file(sample_path,
+split)`, exported from `sample/__init__` along with `SPLITS` — `distill.py` needs the 3 paths in
+runs that build no sampler.
+
+**`exclude_keys` is a NON-ISSUE for our provenance keys** (checked, do not "fix" it):
+`nequip/data/ase.py:55` builds `include_keys` from `ase_all_properties` + the user's
+`include_keys`, and reads ONLY those out of `atoms.info`/`atoms.arrays`. `base_frame`,
+`base_frame_key`, `variant`, `md_step` are not ASE calculator properties, so nequip never looks
+at them. The `../distillation` crash was `dipole`/`free_energy` — real ASE properties, present on
+some frames only. Our frames all carry exactly energy+forces from one `SinglePointCalculator`.
+
 `tests/test_resume.py` — 16 tests, ~26 s, CPU only, NO teacher and NO GPU. `pytest` from repo
-root (config in `pyproject.toml`). See "Test suite" below.
+root (config in `pyproject.toml`). `tests/smoke_tests.py` — 15 `nequip-distill` end-to-end cases,
+~4 min, run by hand, NOT collected by pytest. See "Test suite" below.
 
 `pyproject.toml` — `[project.scripts] nequip-distill = "nequip_extension_template.scripts.distill:main"`,
 `[project.optional-dependencies] test = ["pytest"]`, `[tool.pytest.ini_options] testpaths`.
-`nequip>=0.17.1,<0.18` (`01e07a8`+, was the template's `>=0.13.0`; 0.17.1 is what everything was
-validated against). Still template-shaped otherwise: `name="TODO"`-style placeholders in `description`/`authors`, `license={file=LICENSE}` but
+`nequip>=0.17.1`, NO upper bound (user, 2026-08-28 — wants it usable with nequip 0.19; env still
+has 0.17.1, which is what every integration fact here was validated against, so 0.19 is UNTESTED.
+If it misbehaves, re-check the two things the student side leans on: `nequip.scripts.train.main`
+taking a config as its first positional arg, and `run_stage` restart semantics). Still template-shaped otherwise: `name="TODO"`-style placeholders in `description`/`authors`, `license={file=LICENSE}` but
 no LICENSE file. Package name stays `nequip_extension_template` — DELIBERATE, no final name
 chosen; rename later touches `pyproject.toml` (`name`, `packages.find.include`, entry-points,
 `version.attr`) + every intra-pkg import.
@@ -196,13 +227,15 @@ Must ALWAYS pass the config (`train.main()` with no arg parses sys.argv, mints a
 folder). Consequence: `${hydra:runtime.output_dir}` in the config resolves to OUR folder —
 template's `ModelCheckpoint.dirpath`/`logger.save_dir` land in the one folder, no rewriting by
 us. Version pin still wanted for `run_stage`/restart behavior (`pyproject.toml` →
-`>=0.17,<0.18`). Config handed over: strip `sample` from `run`, drop `sampler`/`sample_path`,
+`>=0.17.1`, no upper bound). Config handed over: strip `sample` from `run`, drop `sampler`/`sample_path`,
 point `train_file_path`/`val_file_path`/`test_file_path` at the 3 sample files (supersedes D5's
 older single-file plan).
 
 **D10. Progress DERIVED from artifacts, no distill-level program counter.** Sample stage →
 sample-side state file (D7). Train/val/test → nequip's own `run_stage` (registered buffer in
-checkpoint, `nequip/train/lightning.py:161`), untouched.
+checkpoint, `nequip/train/lightning.py:161`), untouched. **Caveat, measured: `run_stage` carries
+almost no information** — see D11's corrected trap note. It is 0 in every checkpoint a
+`train`-first run produces, so it does not distinguish "finished" from "died during epoch 1".
 
 **D11. ONE ckpt key `ckpt_path`.** `warm_start_from` proposed + REJECTED (user). Script picks
 Path A vs B from whether dataset grew (only thing that knows):
@@ -210,15 +243,60 @@ Path A vs B from whether dataset grew (only thing that knows):
 - grew → Path B, rewrite `training_module.model` to `ModelFromCheckpoint` from `best.ckpt`
   (D12), warm start on extended data. Log loudly (expensive, easy accident either way).
 - escape hatch: user-written `ModelFromCheckpoint`/`ModelFromPackage` builder respected, untouched.
-- **TRAP guarded against:** strip `sample` → nequip sees `run:[train,val,test]` (len 3), a
-  completed run stored `run_stage==3`. Bump sample count + keep `ckpt_path` → sampler appends
-  frames, nequip loads ckpt, loop never executes, exits 0 having trained on nothing new. Only the
-  distill script catches this: record `n_written` before sampling, compare after.
+- **TRAP guarded against, IMPLEMENTED (`distill.py` raises).** Bump sample count + keep
+  `ckpt_path` → sampler appends frames, nequip restarts the OLD run: it resumes at the restored
+  epoch and stops at the same `max_epochs`, so the new structures get only the leftover epochs,
+  or none if that run finished. Only the distill script can catch this: record `n_written` before
+  sampling, compare after. Measured with the guard removed (`tests/smoke_tests.py`): source run
+  logged epochs `['0','1']`, restarted run logged only `['1']`, exit 0.
+  **The original premise was WRONG and is corrected here: a completed run does NOT store
+  `run_stage==3`.** nequip advances `run_stage` after each stage RETURNS, but only Lightning
+  writes checkpoints and only during `fit`; `val`/`test` write none. So every checkpoint from a
+  `train`-first run holds `run_stage == 0` no matter how far the run got — verified on a finished
+  20-epoch GPU run (`epoch=19`, `run_stage=0`, `runs=['train','val','test']`). A `ckpt_path`
+  restart therefore ALWAYS replays train, val and test; `train` just returns immediately when the
+  restored epoch is already `max_epochs`. `run_stage` would only be nonzero if `train` were not
+  the first stage.
 
 **D12. `best.ckpt` vs `last.ckpt` are different jobs — never say "ckpt_path" generically.**
 `last.ckpt` = resume point (Path A). `best.ckpt` = best on monitored metric, warm-start (Path B)
 must start from THIS not last-epoch weights (`nequip/scripts/train.py` dispatch loop sets
 `ckpt_path="best"` after a `train` stage, confirmed).
+
+**D12a. `last.ckpt` IS NOT THE NEWEST EPOCH under a monitored callback (MEASURED, lightning
+2.6.1). Documented behaviour, not a bug — `save_last` is relative to SAVES, not to epochs.**
+`model_checkpoint.py:117`: "saves a `last.ckpt` copy whenever a checkpoint file gets saved".
+Mechanism at `model_checkpoint.py:514-517` — `_save_last_checkpoint` runs only `if
+self._last_global_step_saved == trainer.global_step`, i.e. only when the top-k save fired at that
+same step; with a `monitor` that is only on an improvement. `on_train_end` (line 536) saves last
+only `if not self._last_checkpoint_saved`, so it does not fix it either.
+
+Measured in PURE lightning (no nequip), 5 epochs, metric worsening every epoch so best = epoch 0,
+newest = epoch 4:
+
+| `ModelCheckpoint` args | `last.ckpt` |
+|---|---|
+| `monitor=<metric>, save_top_k=1` (our config, AND nequip's tutorial) | epoch 0 — the best |
+| `monitor=<metric>, save_last="link"` | epoch 0 — the best |
+| `monitor=<metric>, save_top_k=-1` | epoch 4 — newest |
+| `monitor=None` | epoch 4 — newest |
+
+Not a short-run artifact (checked at 5 and 6 epochs and against a 20-epoch GPU run, where best
+happened to BE the last epoch so it hid the effect).
+
+**Consequence: `ckpt_path=.../last.ckpt` resumes from the last IMPROVING epoch and silently drops
+everything after it.** Harmless on a still-improving run, expensive on a plateau. Fix = a second,
+purely temporal callback next to the monitored one:
+```yaml
+- _target_: lightning.pytorch.callbacks.ModelCheckpoint
+  monitor: null           # saves every epoch, unconditionally
+  dirpath: ${hydra:runtime.output_dir}
+  filename: latest
+  save_top_k: 1           # one file, overwritten each epoch
+  enable_version_counter: false
+```
+NOT added yet — belongs with D15 (`student_path`), and `testartifacts/rattle_train.yaml` still
+has the single monitored callback.
 
 **D13. Lightning checkpoint versioning must be OFF for a shared student dir.** Confirmed in
 installed lightning `model_checkpoint.py`: version counter (`enable_version_counter=True`
@@ -393,8 +471,15 @@ it. Rattle displacement must be measured against the STRAINED parent, not the un
 ## Sandbox — `testartifacts/`
 
 Tracked configs: `test_distill.yaml` (user's, pre-existing, water/`WaterDataModule`, NOT used by
-our configs), `rattle_only.yaml`, `md_only.yaml`. Gitignored: `testartifacts/inputs/`,
-`testartifacts/out/`.
+our configs), `rattle_only.yaml`, `md_only.yaml`, `rattle_train.yaml`. Gitignored:
+`testartifacts/inputs/`, `testartifacts/out/`.
+- `rattle_train.yaml` — the FULL distillation config: `run: [sample, train, val, test]`, rattle
+  half copied from `rattle_only.yaml`, student half = `ASEDataModule` + `EMALightningModule` +
+  `NequIPGNNModel` (2 layers, `l_max: 1`, `num_features: [32, 16]`, `r_max: 6.0` — the CDP
+  student arch from `../distillation/config/base.yaml`), CSVLogger, `max_epochs: 20`,
+  `ModelCheckpoint(dirpath=${hydra:runtime.output_dir}, filename=best, save_last=true)`. Its
+  `data:` block deliberately has NO `*_file_path` and NO `split_dataset` — `distill.py` fills
+  those in. 50 structures → 40/5/5.
 - `inputs/teacher.nequip.zip` — copied from
   `../distillation/results/CDP/student_direct/S1b/n200_seed1/model.nequip.zip`. THE teacher,
   loaded eagerly (packaged, not compiled — works, just slower).
@@ -410,9 +495,20 @@ our configs), `rattle_only.yaml`, `md_only.yaml`. Gitignored: `testartifacts/inp
 CONDA=/n/holylabs/kozinsky_lab/Users/lsteinberger/conda/envs/nequip311
 export LD_LIBRARY_PATH=$CONDA/lib:${LD_LIBRARY_PATH:-}
 # from repo root; hydra does NOT chdir so relative paths resolve to launch cwd; -cp must be ABSOLUTE
-$CONDA/bin/python -m nequip_extension_template.scripts.distill -cp $PWD/testartifacts -cn rattle_only
-$CONDA/bin/python -m nequip_extension_template.scripts.distill -cp $PWD/testartifacts -cn md_only
+$CONDA/bin/nequip-distill -cp $PWD/testartifacts -cn rattle_train   # sample + train + val + test
+$CONDA/bin/nequip-distill -cp $PWD/testartifacts -cn rattle_only    # sample only
+$CONDA/bin/nequip-distill -cp $PWD/testartifacts -cn md_only
 ```
+`nequip-distill` is on PATH because the repo is `pip install -e . --no-deps --no-build-isolation`
+into nequip311. Editable, so edits are live; re-run only if entry points change. Needed
+`license = {file = "LICENSE"}` dropped from `pyproject.toml` first — no LICENSE file exists.
+`nequip-distill --help` FAILS with no `config.yaml` in cwd (hydra composes before help); use
+`-cp ... -cn ... --cfg job` to inspect a resolved config instead.
+**`-cp` MUST be absolute** — hydra resolves a relative `--config-path` against the DECORATED
+FUNCTION'S MODULE, so `-cp testartifacts` fails with `Primary config module
+'nequip_extension_template.scripts.testartifacts' not found` (user hit this). `nequip-train` has
+the identical trap. Auto-absolutizing `-cp` in a wrapper was PROPOSED and REJECTED (user,
+2026-08-28): match nequip's behavior, do not diverge from it for convenience.
 All runs go through Slurm (user explicit, never login node).
 
 **`testartifacts/out/rattle_smoke` and `md_smoke` predate `f9689f3`** — no `sampler_state.pt`, so
@@ -444,6 +540,37 @@ n appends (a structure count, not a wall-clock timeout, so the kill lands at a k
 **Suite was mutation-checked**, each mutation caught only by the right tests:
 `truncate_to` → no-op ⇒ 2 failures; rattle `restore_progress` forgets `n_steps` ⇒ 3;
 `check_goal` early-return ⇒ 3.
+
+### `tests/smoke_tests.py` — the `nequip-distill` command end to end
+
+15 cases, ~4 min, CPU only, NO teacher and NO GPU. **NOT collected by pytest** (name is
+deliberate — `pytest` only picks up `test_*.py`). Run by hand:
+
+```bash
+OMP_NUM_THREADS=2 $CONDA/bin/python tests/smoke_tests.py [-k <substring>] [--keep]
+```
+
+Each case writes a config and runs `python -m nequip_extension_template.scripts.distill`
+as a SUBPROCESS — `@hydra.main` owns global state and does not survive two calls in one
+interpreter, and the point is to exercise the command as a user meets it. `hydra.run.dir`
+is pinned per case so assertions can look inside it. Calculator = `LennardJones` (Ar
+params) over 10 synthetic 32-atom fcc argon cells (fcc, NOT random positions — random
+points in a box put atoms on top of each other and LJ energies explode); student = 1
+layer, `l_max: 0`, `num_features: 8`, 2 epochs, `accelerator: cpu`. 40 structures →
+32/4/4. A full sample+train+val+test case costs ~16 s.
+
+Covers: 7 refusals (unknown run type, `sample` not first, empty `run`, missing dataset,
+missing `trainer`, non-`ASEDataModule`, `split_dataset` set), sample-only + its re-run
+(byte-identical files), full pipeline, two students on one dataset (earlier `best.ckpt`
+not clobbered — different hydra dirs), train-only with a DELIBERATELY BROKEN calculator
+target (proves no sampler is built) plus a bogus `train_file_path` (proves the
+overwrite), `ckpt_path: null`, checkpoint restart, and the D11 refusal.
+
+**Mutation-checked**, 3 mutations, each caught by exactly its case: don't pop a null
+`ckpt_path` ⇒ nequip logs "Building `training_module` from checkpoint file None";
+delete the D11 guard ⇒ run exits 0 after `TRAIN RUN START` + `max_epochs=2 reached`,
+having trained on none of the 40 new structures (this is the trap, MEASURED); don't
+overwrite a user-set `*_file_path` ⇒ nequip reads `nonexistent.xyz`.
 
 ## Conventions
 
@@ -484,6 +611,11 @@ n appends (a structure count, not a wall-clock timeout, so the kill lands at a k
    total. Rattle splits per base frame (so the map must be keyed by frame hash, not list index);
    MD splits per snapshot, and with `blocked` each extension gets its OWN contiguous val/test tail
    rather than one tail for the whole trajectory — a real cost, flag it before building.
-4. Hand dataset to `nequip.scripts.train.main(config)` per D9 — three `*_file_path` lists, strip
-   `sample` from `run`, drop `sampler`/`sample_path`.
-5. `student_path` (D15, now settled) + `student_state.json` + D14 archive hook.
+4. `student_path` (D15) + `student_state.json` + D14 archive hook. Deferred ON PURPOSE (user,
+   2026-08-28): student uses nequip's normal checkpoints-in-the-hydra-dir semantics for now, so a
+   training restart needs an explicit `ckpt_path`.
+5. Warm start on a grown dataset (D11 Path B, `ModelFromCheckpoint` rewrite). Until then
+   `distill.py` REFUSES that combination rather than silently training on nothing.
+
+**DONE (2026-08-28)**: old #4, the train handoff — see State. Order above reflects the user's
+call to get a runnable `nequip-distill` out first and improve resume behavior after.
