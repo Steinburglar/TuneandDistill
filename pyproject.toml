@@ -17,11 +17,19 @@ dependencies = [
     "nequip>=0.13.0"
 ]
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [tool.setuptools.packages.find]
 include = ["nequip-extension-template", "nequip_extension_template", "nequip_extension_template.*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "nequip_extension_template._version.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The suite is deliberately CPU-only and teacher-free -- see tests/test_resume.py.
+addopts = "-q"
 
 [tool.ruff]
 line-length = 88
